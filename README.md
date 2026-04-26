@@ -155,7 +155,7 @@ The environment follows the OpenEnv spec: `Environment` base class with Gym-styl
 | Resource                     | Link                                                                                                        |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | 🤗 HF Space (Live Demo)      | [spaces/Sumayyakhalid92587/drug-discovery](https://huggingface.co/spaces/Sumayyakhalid92587/drug-discovery) |
-| 📓 Training Notebook (Colab) | [Open in Colab](https://colab.research.google.com/drive/1HlA3rWhufUO823gIfxiUKI0uDqPUmYfx)                  |
+| 📓 Training Notebook (Colab) | [Open in Colab](https://colab.research.google.com/drive/1HlA3rWhufUO823gIfxiUKI0uDqPUmYfx?usp=drive_link)   |
 | 💻 Code Repository           | [GitHub](https://github.com/coral-cyber/drug-discovery.git)                                                 |
 | 📝 HF Blog Post              | [Read the writeup](https://huggingface.co/spaces/Sumayyakhalid92587/drug-discovery/blob/main/blog.md)       |
 
