@@ -1,88 +1,72 @@
-## Bidirectional Adversarial Reinforcement Learning for Drug Discovery: When Molecules and Mutations Compete
+---
+title: Bidirectional Adversarial RL Drug Discovery
+emoji: 🧬
+colorFrom: blue
+colorTo: purple
+sdk: fastapi
+app_file: api/main.py
+pinned: false
+---
 
-Drug discovery usually assumes a stable target: a receptor stays fixed, and the goal is to design a molecule that binds well. Reality is harsher. In biology, targets evolve. Viruses mutate. Cancer adapts. A molecule that works today can quietly fail tomorrow. This project flips that assumption by making the target itself learn to resist.
+# Bidirectional Adversarial Reinforcement Learning for Drug Discovery
 
-### A System Where the Environment Fights Back
+Drug discovery usually assumes a fixed biological target. This project removes that assumption by introducing a **co-evolving adversary system**.
 
-Instead of training a single agent, this system trains two:
+## Core Idea
 
-- A **Ligand Designer** that proposes molecules aiming for strong binding.
-- A **Receptor Mutator** that continuously alters the target to reduce binding effectiveness.
+Two agents are trained in a shared environment:
 
-The key idea is simple but powerful: the environment is not static. It actively adapts against the agent in real time through a shared mutable state (`ReceptorState`). Every ligand action is immediately challenged by a receptor change. No post-processing. No frozen benchmarks.
+- **Ligand Designer** → generates molecules to maximize binding
+- **Receptor Mutator** → modifies receptor structure to reduce binding
 
-This turns reinforcement learning into a live evolutionary arms race.
+This creates a **dynamic evolutionary arms race**, not a static optimization problem.
 
-### Why This Changes the Learning Problem
+## Why it matters
 
-In traditional RL-based drug design, the agent overfits to a fixed receptor. It finds a “best molecule” for a single shape. But that solution is brittle.
+Traditional RL drug design:
 
-Here, the receptor mutator forces constant adaptation:
+- Fixed receptor → overfitting risk
 
-- Early training: random small mutations → easy wins for ligand
-- Mid training: targeted disruption of binding pockets
-- Late training: intelligent pressure on learned weaknesses
+This system:
 
-The ligand agent is no longer optimizing for one peak. It is learning to survive a shifting landscape.
+- Evolving receptor → robustness pressure
+- Forces generalization across mutations
 
-### The Counterintuitive Result That Means It Works
+## Key Mechanism
 
-One of the most important signals in this system looks wrong at first:
+At each step:
 
-> The average binding score drops in later training.
+1. Ligand proposes molecule
+2. Receptor mutates immediately
+3. Binding is recomputed on updated state
 
-This is not failure. It is evidence of robustness.
+No frozen benchmark. No static target.
 
-Early in training, the ligand achieves a peak binding score (~0.69). Later, as the receptor mutator becomes stronger, scores fluctuate and decline. But those later ligands are not worse — they are more general. They bind reasonably well across many mutated receptor variants instead of exploiting a single fragile configuration.
+## Phase 2: Escape Attack
 
-This is the difference between:
+An additional **Escape Agent** discovers receptor mutations that break high-performing ligands and feeds them back into training.
 
-- “works in simulation”
-- and “survives in reality”
+This creates a full loop:
 
-### Phase 2: Learning from Failure (Escape Attack)
+- Design → Resistance → Exploit → Retrain
 
-After co-training, a third agent enters: the **Escape Agent**.
+## Outcome
 
-Its job is not to design drugs, but to break them.
+Instead of a single “best molecule”, the system produces:
 
-It searches for receptor mutations that specifically disrupt the best ligand discovered in Phase 1. These “escape motifs” become hard negative examples, fed back into training. This closes the loop:
+- Mutation-robust ligands
+- Hard negative receptor cases
+- Adaptive drug design policies
 
-1. Ligand learns to bind
-2. Receptor learns to resist
-3. Escape agent finds weaknesses
-4. System retrains on those weaknesses
+## Insight
 
-The result is a feedback loop that systematically removes brittle solutions.
+Lower binding score in later training ≠ failure  
+It indicates **robustness under adversarial pressure**
 
-### Why This Cannot Be Simulated with Separate Models
+---
 
-If ligand and receptor are trained independently and compared later, the system fails to generalize. The reason is structural:
+Built for research in:
 
-- Separate training = static opponent → overfitting
-- Bidirectional training = shared evolving state → co-adaptation
-
-The critical mechanism is **immediate coupling**. When the receptor mutates, the ligand’s environment changes in the same step. This creates a moving target that forces continuous adaptation rather than memorization.
-
-### What Emerges From the System
-
-Instead of a single “best molecule,” the system produces:
-
-- Ligands with higher **robustness across mutations**
-- Learned **escape-resistant binding patterns**
-- A dataset of **failure-inducing receptor mutations**
-- A curriculum generated automatically by adversarial pressure
-
-In short, it doesn’t just optimize binding. It learns resistance-aware binding.
-
-### Why This Matters
-
-Most AI drug discovery pipelines still optimize against static biology. But biology is not static. Resistance is the default behavior, not an exception.
-
-A system like this shifts the objective:
-
-Not “find a molecule that binds”
-but
-“find a molecule that keeps binding even when biology fights back”
-
-That distinction is where real-world drug resilience begins.
+- Adversarial RL
+- Drug discovery
+- Evolutionary optimization
