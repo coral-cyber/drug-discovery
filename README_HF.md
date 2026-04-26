@@ -3,7 +3,7 @@ title: Bidirectional Adversarial RL Drug Discovery
 emoji: 🧬
 colorFrom: blue
 colorTo: purple
-sdk: fastapi
+sdk: docker
 app_file: api/main.py
 pinned: false
 ---
