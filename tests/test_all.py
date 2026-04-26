@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
+from core.system import run_cli
 
 import numpy as np
 import pytest
@@ -363,6 +362,6 @@ def test_api_phase2_requires_phase1(client):
 
 @pytest.mark.parametrize("args", [["--phase1", "--episodes", "2", "--dimension", "6", "--max-steps", "3"], ["--phase2", "--episodes", "2", "--dimension", "6", "--max-steps", "3"], ["--phase1", "--phase2", "--episodes", "2", "--dimension", "6", "--max-steps", "3"], ["--episodes", "2", "--dimension", "6", "--max-steps", "3"]])
 def test_cli_runs(args):
-    result = subprocess.run([sys.executable, "run_training.py", *args], capture_output=True, text=True, cwd="/workspace")
+    result = run_cli(args)
     assert result.returncode == 0
     assert "phase" in result.stdout

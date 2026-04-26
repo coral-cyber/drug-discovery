@@ -7,6 +7,9 @@ from pydantic import BaseModel, Field
 import numpy as np
 
 from core.trainer import AdversarialTrainer, BidirectionalTrainer
+from fastapi.middleware.cors import CORSMiddleware
+
+
 
 
 app = FastAPI(title="Bidirectional Adversarial RL API", version="1.0.0")
@@ -88,3 +91,10 @@ def flow(phase: str) -> dict[str, Any]:
         trainer = _state["phase2_trainer"]
         return {"phase": phase, "events": _sanitize(trainer.flow_history)}
     return {"phase": phase, "events": []}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
