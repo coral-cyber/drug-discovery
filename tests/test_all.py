@@ -1,6 +1,8 @@
 from __future__ import annotations
-
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import json
+
 from core.system import run_cli
 
 import numpy as np
