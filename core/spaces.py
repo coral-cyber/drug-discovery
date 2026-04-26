@@ -1,100 +1,105 @@
-"""Action and observation spaces (Box, Discrete, MultiDiscrete). No gymnasium dependency."""
-
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Iterable, Sequence
+
 import numpy as np
-from numpy.typing import NDArray
 
 
-class Space:
-    """Abstract base for all spaces."""
-
-    def __init__(self, shape: tuple[int, ...], dtype: np.dtype | type = np.float64):
-        self.shape = shape
-        self.dtype = np.dtype(dtype)
-
-    def sample(self, rng: np.random.Generator | None = None) -> NDArray:
-        raise NotImplementedError
-
-    def contains(self, x: NDArray) -> bool:
-        raise NotImplementedError
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(shape={self.shape}, dtype={self.dtype})"
-
-
-class Box(Space):
-    """Continuous multi-dimensional space bounded by low/high."""
+@dataclass(frozen=True)
+class Box:
+    low: np.ndarray
+    high: np.ndarray
+    shape: tuple[int, ...]
+    dtype: type = np.float64
 
     def __init__(
         self,
-        low: float | NDArray,
-        high: float | NDArray,
+        low: float | Sequence[float] | np.ndarray,
+        high: float | Sequence[float] | np.ndarray,
         shape: tuple[int, ...] | None = None,
-        dtype: np.dtype | type = np.float64,
-    ):
+        dtype: type = np.float64,
+    ) -> None:
+        low_arr = np.asarray(low, dtype=dtype)
+        high_arr = np.asarray(high, dtype=dtype)
         if shape is None:
-            low_arr = np.asarray(low, dtype=dtype)
-            high_arr = np.asarray(high, dtype=dtype)
-            if low_arr.ndim == 0 and high_arr.ndim == 0:
-                raise ValueError("shape must be provided when low/high are scalars")
-            shape = np.broadcast_shapes(low_arr.shape, high_arr.shape)
-        super().__init__(shape, dtype)
-        self.low = np.broadcast_to(np.asarray(low, dtype=dtype), shape).copy()
-        self.high = np.broadcast_to(np.asarray(high, dtype=dtype), shape).copy()
+            inferred_shape = low_arr.shape or high_arr.shape
+            if not inferred_shape:
+                raise ValueError("shape must be provided for scalar bounds")
+            shape = inferred_shape
+        if low_arr.shape == ():
+            low_arr = np.full(shape, float(low_arr), dtype=dtype)
+        if high_arr.shape == ():
+            high_arr = np.full(shape, float(high_arr), dtype=dtype)
+        if low_arr.shape != shape or high_arr.shape != shape:
+            raise ValueError("bounds must match shape")
+        if np.any(low_arr > high_arr):
+            raise ValueError("low must be <= high")
+        object.__setattr__(self, "low", low_arr.astype(dtype))
+        object.__setattr__(self, "high", high_arr.astype(dtype))
+        object.__setattr__(self, "shape", tuple(shape))
+        object.__setattr__(self, "dtype", dtype)
 
-    def sample(self, rng: np.random.Generator | None = None) -> NDArray:
-        rng = rng or np.random.default_rng()
-        return rng.uniform(self.low, self.high).astype(self.dtype)
+    def sample(self, rng: np.random.Generator | None = None) -> np.ndarray:
+        generator = rng or np.random.default_rng()
+        return generator.uniform(self.low, self.high).astype(self.dtype)
 
-    def contains(self, x: NDArray) -> bool:
-        x = np.asarray(x, dtype=self.dtype)
-        if x.shape != self.shape:
-            return False
-        return bool(np.all(x >= self.low) and np.all(x <= self.high))
+    def contains(self, x: Iterable[float] | np.ndarray) -> bool:
+        arr = np.asarray(x, dtype=self.dtype)
+        return arr.shape == self.shape and np.all(arr >= self.low) and np.all(arr <= self.high)
 
-    def clip(self, x: NDArray) -> NDArray:
-        return np.clip(np.asarray(x, dtype=self.dtype), self.low, self.high)
+    def clip(self, x: Iterable[float] | np.ndarray) -> np.ndarray:
+        return np.clip(np.asarray(x, dtype=self.dtype), self.low, self.high).astype(self.dtype)
 
-    def __repr__(self) -> str:
-        return f"Box(low={self.low.min():.2f}, high={self.high.max():.2f}, shape={self.shape})"
+    def to_jsonable(self) -> dict[str, object]:
+        return {
+            "type": "Box",
+            "shape": self.shape,
+            "low": self.low.tolist(),
+            "high": self.high.tolist(),
+        }
 
 
-class Discrete(Space):
-    """Integer space {0, 1, ..., n-1}."""
+@dataclass(frozen=True)
+class Discrete:
+    n: int
 
-    def __init__(self, n: int):
-        super().__init__(shape=(), dtype=np.int64)
-        self.n = n
+    def __post_init__(self) -> None:
+        if self.n <= 0:
+            raise ValueError("n must be positive")
 
     def sample(self, rng: np.random.Generator | None = None) -> int:
-        rng = rng or np.random.default_rng()
-        return int(rng.integers(0, self.n))
+        generator = rng or np.random.default_rng()
+        return int(generator.integers(0, self.n))
 
-    def contains(self, x: int | NDArray) -> bool:
-        x_int = int(x)
-        return 0 <= x_int < self.n
+    def contains(self, x: object) -> bool:
+        return isinstance(x, (int, np.integer)) and 0 <= int(x) < self.n
 
-    def __repr__(self) -> str:
-        return f"Discrete(n={self.n})"
+    def to_jsonable(self) -> dict[str, object]:
+        return {"type": "Discrete", "n": self.n}
 
 
-class MultiDiscrete(Space):
-    """Multiple independent discrete spaces."""
+@dataclass(frozen=True)
+class MultiDiscrete:
+    nvec: np.ndarray
 
-    def __init__(self, nvec: list[int] | NDArray):
-        self.nvec = np.asarray(nvec, dtype=np.int64)
-        super().__init__(shape=self.nvec.shape, dtype=np.int64)
+    def __init__(self, nvec: Sequence[int] | np.ndarray) -> None:
+        arr = np.asarray(nvec, dtype=np.int64)
+        if arr.ndim != 1 or np.any(arr <= 0):
+            raise ValueError("nvec must be a positive 1D array")
+        object.__setattr__(self, "nvec", arr)
 
-    def sample(self, rng: np.random.Generator | None = None) -> NDArray:
-        rng = rng or np.random.default_rng()
-        return np.array([rng.integers(0, n) for n in self.nvec], dtype=np.int64)
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.nvec.shape
 
-    def contains(self, x: NDArray) -> bool:
-        x = np.asarray(x, dtype=np.int64)
-        if x.shape != self.shape:
-            return False
-        return bool(np.all(x >= 0) and np.all(x < self.nvec))
+    def sample(self, rng: np.random.Generator | None = None) -> np.ndarray:
+        generator = rng or np.random.default_rng()
+        return np.array([generator.integers(0, n) for n in self.nvec], dtype=np.int64)
 
-    def __repr__(self) -> str:
-        return f"MultiDiscrete(nvec={self.nvec.tolist()})"
+    def contains(self, x: Sequence[int] | np.ndarray) -> bool:
+        arr = np.asarray(x, dtype=np.int64)
+        return arr.shape == self.nvec.shape and np.all(arr >= 0) and np.all(arr < self.nvec)
+
+    def to_jsonable(self) -> dict[str, object]:
+        return {"type": "MultiDiscrete", "nvec": self.nvec.tolist()}

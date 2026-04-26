@@ -1,280 +1,220 @@
-"""BidirectionalTrainer (Phase 1) and AdversarialTrainer (Phase 2).
-
-Orchestrates the tight co-training loop between Agent_A and Agent_B,
-with reward monitoring, entropy floor, and LLM bias injection.
-"""
-
 from __future__ import annotations
 
-import logging
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from numpy.typing import NDArray
 
 from agents.escape_agent import EscapeAgent
-from agents.ligand_agent import LigandDesigner, Transition
-from agents.receptor_agent import ReceptorMutator
-from core.receptor import BindingOracle, ReceptorState
+from agents.ligand_agent import LigandDesignerAgent
+from agents.receptor_agent import ReceptorMutatorAgent
+from core.receptor import ReceptorState
+from core.utils import RewardNormalizer, safe_ratio
 from envs.ligand_env import LigandEnv
 from envs.receptor_env import ReceptorEnv
-from llm.llm_bridge import LLMBridge
+from llm.llm_bridge import ClaudeLLMBridge
 
-logger = logging.getLogger(__name__)
+
+@dataclass
+class PhaseSummary:
+    phase: str
+    episodes: int
+    metrics: dict[str, Any]
 
 
 class BidirectionalTrainer:
-    """Phase 1: co-trains LigandDesigner + ReceptorMutator in a tight loop."""
-
-    def __init__(
-        self,
-        *,
-        dim: int = 16,
-        max_steps: int = 50,
-        episodes: int = 200,
-        gamma: float = 0.99,
-        binding_threshold: float = 0.85,
-        reward_ratio_alert: float = 3.0,
-        entropy_floor: float = 0.5,
-        noise_injection: float = 0.1,
-        llm_call_every: int = 10,
-        llm_weight: float = 0.25,
-        seed: int = 0,
-    ):
-        self.dim = dim
+    def __init__(self, dimension: int = 8, max_steps: int = 6, llm_interval: int = 2, seed: int = 0, min_entropy: float = 1.2) -> None:
+        self.dimension = dimension
         self.max_steps = max_steps
-        self.episodes = episodes
-        self.gamma = gamma
-        self.binding_threshold = binding_threshold
-        self.reward_ratio_alert = reward_ratio_alert
-        self.entropy_floor = entropy_floor
-        self.noise_injection = noise_injection
+        self.llm_interval = max(1, llm_interval)
+        self.seed = seed
+        self.min_entropy = min_entropy
+        self.receptor = ReceptorState(dimension=dimension, wildtype_seed=seed + 11)
+        self.ligand_env = LigandEnv(self.receptor, max_steps=max_steps, seed=seed)
+        self.receptor_env = ReceptorEnv(self.receptor, seed=seed)
+        self.ligand_agent = LigandDesignerAgent(obs_dim=self.ligand_env.observation_space.shape[0], action_space=self.ligand_env.action_space, seed=seed)
+        self.receptor_agent = ReceptorMutatorAgent(obs_dim=self.receptor_env.observation_space.shape[0], action_space=self.receptor_env.action_space, seed=seed + 1)
+        self.llm_bridge = ClaudeLLMBridge()
+        self.ligand_rewards = RewardNormalizer()
+        self.receptor_rewards = RewardNormalizer()
+        self.flow_history: list[dict[str, Any]] = []
+        self.metrics_history: list[dict[str, Any]] = []
+        self.alerts: list[str] = []
+        self.best_ligand: np.ndarray | None = None
+        self.best_ligand_score = -float("inf")
+        self.best_ligand_record: dict[str, Any] = {}
+        self.ligand_env.set_transition_hook(self.preview_receptor_transition)
+        self.receptor_env.set_probe_hook(self._ligand_probe_hook)
 
-        self._rng = np.random.default_rng(seed)
+    def preview_receptor_transition(self, context: dict[str, Any]) -> dict[str, Any]:
+        probe_readings = self.receptor_env._probe_readings()
+        obs = np.concatenate([self.receptor.clone_vector(), np.asarray(probe_readings, dtype=np.float64)])
+        preview = self.receptor_agent.policy_mean(obs)
+        return {"proposed_mutation": self.receptor_env.action_space.clip(preview).round(6).tolist(), "source": "ReceptorMutator preview"}
 
-        self.receptor_state = ReceptorState(dim=dim, noise_std=0.05)
-        self.oracle = BindingOracle(dim=dim)
+    def _ligand_probe_hook(self, count: int) -> list[np.ndarray]:
+        return self.ligand_agent.probe_candidates(self.receptor.clone_vector(), count=count)
 
-        self.ligand_env = LigandEnv(
-            self.receptor_state,
-            self.oracle,
-            max_steps=max_steps,
-            gamma=gamma,
-            binding_threshold=binding_threshold,
-            seed=seed,
+    def _should_query_llm(self, episode: int) -> bool:
+        return episode % self.llm_interval == 0
+
+    def _balance_rewards(self, ligand_reward: float, receptor_reward: float) -> None:
+        ligand_norm = self.ligand_rewards.update(ligand_reward)
+        receptor_norm = self.receptor_rewards.update(receptor_reward)
+        ratio = safe_ratio(ligand_norm + 1e-6, receptor_norm + 1e-6)
+        if ratio > 3.0:
+            self.alerts.append(f"reward dominance alert ratio={ratio:.2f}")
+
+    def _entropy_guards(self) -> None:
+        if self.ligand_agent.ensure_entropy_floor(self.min_entropy):
+            self.alerts.append("ligand entropy floor activated")
+        if self.receptor_agent.ensure_entropy_floor(self.min_entropy):
+            self.alerts.append("receptor entropy floor activated")
+
+    def _record_flow(self, env_name: str, agent_name: str, llm_result: dict[str, Any], raw_action: np.ndarray, biased_action: np.ndarray, reward: float, info: dict[str, Any]) -> None:
+        self.flow_history.append(
+            {
+                "flow": ["input(query)", "agent", "LLM", "openenv", "reward", "biased_output", "repeat"],
+                "env": env_name,
+                "agent": agent_name,
+                "query": llm_result["query"],
+                "llm_response": llm_result["response_text"],
+                "used_remote_api": llm_result["used_remote_api"],
+                "agent_output": np.asarray(raw_action, dtype=np.float64).round(6).tolist(),
+                "reward": float(reward),
+                "biased_output": np.asarray(biased_action, dtype=np.float64).round(6).tolist(),
+                "info": info,
+            }
         )
-        self.receptor_env = ReceptorEnv(
-            self.receptor_state,
-            self.oracle,
-            seed=seed + 1,
-        )
 
-        obs_dim_a = dim + 2
-        obs_dim_b = dim + self.receptor_env.probe_steps
-        self.agent_a = LigandDesigner(obs_dim_a, dim, seed=seed + 2)
-        self.agent_b = ReceptorMutator(obs_dim_b, dim, seed=seed + 3)
+    def train_phase1(self, episodes: int = 6) -> PhaseSummary:
+        for episode in range(1, episodes + 1):
+            observation, _ = self.ligand_env.reset(seed=self.seed + episode)
+            episode_reward = 0.0
+            best_episode_binding = -float("inf")
+            best_episode_ligand = None
+            binding_trace: list[float] = []
 
-        self.llm_bridge = LLMBridge(
-            dim=dim,
-            call_every_n=llm_call_every,
-            weight=llm_weight,
-        )
+            for step in range(self.max_steps):
+                if self._should_query_llm(episode):
+                    llm_call = self.llm_bridge.generate_bias("LigandDesigner", self.ligand_env.get_state(), "maximize stable selective binding", self.dimension, episode, step)
+                    ligand_decision = self.ligand_agent.select_action(observation, llm_bias=llm_call.bias_vector)
+                else:
+                    query = self.llm_bridge.build_query("LigandDesigner", self.ligand_env.get_state(), "maximize stable selective binding", self.dimension, episode, step)
+                    llm_call = type("Call", (), {"query": query, "response_text": "{}", "bias_vector": np.zeros(self.dimension), "used_remote_api": False})
+                    ligand_decision = self.ligand_agent.select_action(observation)
+                next_obs, reward, done, info = self.ligand_env.step(ligand_decision["action"])
+                self.ligand_agent.store_transition(observation, ligand_decision["action"], reward, next_obs, ligand_decision["mean"], ligand_decision["entropy"], info)
+                self._record_flow(self.ligand_env.env_id, "LigandDesigner", {"query": llm_call.query, "response_text": llm_call.response_text, "used_remote_api": llm_call.used_remote_api}, ligand_decision["raw_action"], ligand_decision["action"], reward, info)
+                observation = next_obs
+                episode_reward += reward
+                binding_trace.append(info["binding_score"])
+                if info["binding_result"]["total_score"] > self.best_ligand_score:
+                    self.best_ligand_score = info["binding_result"]["total_score"]
+                    self.best_ligand = ligand_decision["action"].copy()
+                    self.best_ligand_record = {"ligand": self.best_ligand.round(6).tolist(), "binding_score": info["binding_result"]["binding_score"], "selectivity": info["binding_result"]["selectivity"], "episode": episode}
+                if info["binding_score"] > best_episode_binding:
+                    best_episode_binding = info["binding_score"]
+                    best_episode_ligand = ligand_decision["action"].copy()
+                if done:
+                    break
 
-        # Wire bidirectional hooks
-        def probe_hook(receptor_vec: NDArray, n: int) -> NDArray:
-            return self.agent_a.get_probe_readings(receptor_vec, n, self.oracle)
-
-        self.receptor_env.set_probe_hook(probe_hook)
-
-        self._metrics: list[dict[str, Any]] = []
-        self._best_ligand_state: dict[str, Any] | None = None
-        self._best_binding = 0.0
-
-    def _check_entropy_floor(self) -> None:
-        ent_a = self.agent_a._entropy()
-        ent_b = self.agent_b._entropy()
-        if ent_a < self.entropy_floor:
-            self.agent_a.log_sigma += self.noise_injection
-            logger.info("Agent_A entropy below floor, injecting noise")
-        if ent_b < self.entropy_floor:
-            self.agent_b.log_sigma += self.noise_injection
-            logger.info("Agent_B entropy below floor, injecting noise")
-
-    def _check_reward_balance(
-        self, reward_a: float, reward_b: float
-    ) -> bool:
-        abs_a = abs(reward_a) + 1e-8
-        abs_b = abs(reward_b) + 1e-8
-        ratio = max(abs_a / abs_b, abs_b / abs_a)
-        if ratio > self.reward_ratio_alert:
-            logger.warning(
-                f"Reward imbalance: ratio={ratio:.2f} (A={reward_a:.4f}, B={reward_b:.4f})"
+            ligand_stats = self.ligand_agent.learn()
+            receptor_obs, receptor_reset_info = self.receptor_env.reset()
+            if self._should_query_llm(episode):
+                receptor_llm = self.llm_bridge.generate_bias("ReceptorMutator", receptor_reset_info["full_state"], "disrupt ligand binding while preserving receptor functionality", self.dimension, episode)
+                receptor_decision = self.receptor_agent.select_action(receptor_obs, llm_bias=receptor_llm.bias_vector)
+            else:
+                query = self.llm_bridge.build_query("ReceptorMutator", receptor_reset_info["full_state"], "disrupt ligand binding while preserving receptor functionality", self.dimension, episode)
+                receptor_llm = type("Call", (), {"query": query, "response_text": "{}", "bias_vector": np.zeros(self.dimension), "used_remote_api": False})
+                receptor_decision = self.receptor_agent.select_action(receptor_obs)
+            _, receptor_reward, _, receptor_info = self.receptor_env.step(receptor_decision["action"])
+            self.receptor_agent.store_episode(receptor_obs, receptor_decision["action"], receptor_reward, receptor_info)
+            receptor_stats = self.receptor_agent.learn()
+            self._record_flow(self.receptor_env.env_id, "ReceptorMutator", {"query": receptor_llm.query, "response_text": receptor_llm.response_text, "used_remote_api": receptor_llm.used_remote_api}, receptor_decision["raw_action"], receptor_decision["action"], receptor_reward, receptor_info)
+            self._balance_rewards(ligand_stats.reward_mean, receptor_stats.reward_mean)
+            self._entropy_guards()
+            self.metrics_history.append(
+                {
+                    "episode": episode,
+                    "ligand_reward": episode_reward,
+                    "avg_binding": float(np.mean(binding_trace)) if binding_trace else 0.0,
+                    "best_episode_binding": best_episode_binding,
+                    "best_episode_ligand": best_episode_ligand.round(6).tolist() if best_episode_ligand is not None else None,
+                    "receptor_reward": receptor_reward,
+                    "ligand_stats": ligand_stats.__dict__,
+                    "receptor_stats": receptor_stats.__dict__,
+                    "shared_state": self.receptor.as_dict(),
+                }
             )
-            return True
-        return False
 
-    def train(self, callback: Any = None) -> list[dict[str, Any]]:
-        """Run Phase 1 co-training loop."""
-        for ep in range(1, self.episodes + 1):
-            ep_metrics = self._run_episode(ep)
-
-            if callback:
-                callback(ep, ep_metrics)
-
-            self._metrics.append(ep_metrics)
-            self._check_entropy_floor()
-
-        return self._metrics
-
-    def _run_episode(self, episode: int) -> dict[str, Any]:
-        obs, info = self.ligand_env.reset()
-        ep_reward_a = 0.0
-        ep_bindings: list[float] = []
-        step = 0
-
-        # LLM bias injection
-        bias = self.llm_bridge.maybe_call(
-            episode,
-            self.receptor_state.vector,
-            self._best_binding,
-            "LigandDesigner",
+        equilibrium = self.metrics_history[-1] if self.metrics_history else {}
+        return PhaseSummary(
+            phase="phase1",
+            episodes=episodes,
+            metrics={
+                "best_ligand": self.best_ligand_record,
+                "equilibrium": equilibrium,
+                "reward_alerts": self.alerts,
+                "flow_events": len(self.flow_history),
+                "shared_state": self.receptor.as_dict(),
+            },
         )
-        if bias is not None:
-            self.agent_a.inject_llm_bias(bias, self.llm_bridge.weight)
-        else:
-            self.agent_a.clear_llm_bias()
-
-        while True:
-            action = self.agent_a.act(obs)
-            next_obs, reward, terminated, truncated, info = self.ligand_env.step(action)
-            done = terminated or truncated
-
-            self.agent_a.store(Transition(obs, action, reward, next_obs, done, info))
-            ep_reward_a += reward
-            ep_bindings.append(info["binding_score"])
-            obs = next_obs
-            step += 1
-
-            if done:
-                break
-
-        learn_a = self.agent_a.learn()
-
-        # Agent_B: episode-level mutation
-        receptor_obs, _ = self.receptor_env.reset()
-        mutation = self.agent_b.act(receptor_obs)
-        _, reward_b, _, _, info_b = self.receptor_env.step(mutation)
-        learn_b = self.agent_b.learn(receptor_obs, mutation, reward_b)
-
-        avg_binding = float(np.mean(ep_bindings)) if ep_bindings else 0.0
-        if avg_binding > self._best_binding:
-            self._best_binding = avg_binding
-            self._best_ligand_state = self.agent_a.get_state()
-
-        self._check_reward_balance(ep_reward_a, reward_b)
-
-        return {
-            "episode": episode,
-            "reward_a": ep_reward_a,
-            "reward_b": float(reward_b),
-            "avg_binding": avg_binding,
-            "max_binding": float(max(ep_bindings)) if ep_bindings else 0.0,
-            "steps": step,
-            "receptor_displacement": self.receptor_state.displacement_from_wildtype,
-            "learn_a": learn_a,
-            "learn_b": learn_b,
-        }
-
-    @property
-    def best_ligand_state(self) -> dict[str, Any] | None:
-        return self._best_ligand_state
-
-    @property
-    def metrics(self) -> list[dict[str, Any]]:
-        return list(self._metrics)
 
 
 class AdversarialTrainer:
-    """Phase 2: trains EscapeAgent against frozen best-ligand policy."""
+    def __init__(self, base_trainer: BidirectionalTrainer, llm_interval: int | None = None, min_entropy: float = 1.2) -> None:
+        self.base_trainer = base_trainer
+        self.receptor = base_trainer.receptor
+        self.best_ligand = np.asarray(base_trainer.best_ligand, dtype=np.float64) if base_trainer.best_ligand is not None else np.zeros(base_trainer.dimension, dtype=np.float64)
+        self.receptor_env = ReceptorEnv(self.receptor, seed=base_trainer.seed + 99)
+        self.escape_agent = EscapeAgent(obs_dim=self.receptor_env.observation_space.shape[0], action_space=self.receptor_env.action_space, seed=base_trainer.seed + 7)
+        self.llm_bridge = ClaudeLLMBridge()
+        self.llm_interval = llm_interval or base_trainer.llm_interval
+        self.min_entropy = min_entropy
+        self.flow_history: list[dict[str, Any]] = []
+        self.metrics_history: list[dict[str, Any]] = []
+        self.reward_normalizer = RewardNormalizer()
+        self.receptor_env.set_probe_hook(self._fixed_probe_hook)
 
-    def __init__(
-        self,
-        *,
-        dim: int = 16,
-        episodes: int = 100,
-        probe_steps: int = 10,
-        mutation_cap: float = 3.0,
-        diversity_coeff: float = 0.1,
-        seed: int = 100,
-        frozen_ligand_state: dict[str, Any] | None = None,
-    ):
-        self.dim = dim
-        self.episodes = episodes
-        self.probe_steps = probe_steps
+    def _fixed_probe_hook(self, count: int) -> list[np.ndarray]:
+        return [self.best_ligand.copy() for _ in range(count)]
 
-        self._rng = np.random.default_rng(seed)
-        self.receptor_state = ReceptorState(dim=dim)
-        self.oracle = BindingOracle(dim=dim)
-
-        obs_dim_a = dim + 2
-        self.frozen_ligand = LigandDesigner(obs_dim_a, dim, seed=seed)
-        if frozen_ligand_state:
-            self.frozen_ligand.load_state(frozen_ligand_state)
-
-        obs_dim_escape = dim + probe_steps
-        self.escape_agent = EscapeAgent(
-            obs_dim_escape,
-            dim,
-            mutation_cap=mutation_cap,
-            diversity_coeff=diversity_coeff,
-            seed=seed + 1,
+    def train_phase2(self, episodes: int = 5) -> PhaseSummary:
+        for episode in range(1, episodes + 1):
+            receptor_obs, reset_info = self.receptor_env.reset()
+            if episode % self.llm_interval == 0:
+                llm_call = self.llm_bridge.generate_bias("EscapeAgent", reset_info["full_state"], "maximize binding disruption against the frozen best ligand", self.base_trainer.dimension, episode)
+                decision = self.escape_agent.select_action(receptor_obs, llm_bias=llm_call.bias_vector)
+            else:
+                query = self.llm_bridge.build_query("EscapeAgent", reset_info["full_state"], "maximize binding disruption against the frozen best ligand", self.base_trainer.dimension, episode)
+                llm_call = type("Call", (), {"query": query, "response_text": "{}", "bias_vector": np.zeros(self.base_trainer.dimension), "used_remote_api": False})
+                decision = self.escape_agent.select_action(receptor_obs)
+            _, reward, _, info = self.receptor_env.step(decision["action"])
+            fixed_binding = self.receptor.binding_oracle(self.best_ligand).binding_score
+            disruption_reward = float((1.0 - fixed_binding) + self.escape_agent.diversity_bonus(decision["action"]))
+            total_reward = reward + disruption_reward
+            info["binding_disruption"] = 1.0 - fixed_binding
+            self.escape_agent.store_episode(receptor_obs, decision["action"], total_reward, info)
+            stats = self.escape_agent.learn()
+            self.reward_normalizer.update(total_reward)
+            if self.escape_agent.ensure_entropy_floor(self.min_entropy):
+                self.base_trainer.alerts.append("escape entropy floor activated")
+            self.base_trainer.ligand_agent.add_hard_negative(info["mutated_receptor"])
+            self.flow_history.append({"flow": ["input(query)", "agent", "LLM", "openenv", "reward", "biased_output", "repeat"], "query": llm_call.query, "llm_response": llm_call.response_text, "reward": total_reward, "biased_output": np.asarray(decision["action"], dtype=np.float64).round(6).tolist(), "info": info})
+            self.metrics_history.append({"episode": episode, "reward": total_reward, "binding_disruption": info["binding_disruption"], "motifs": info["motifs"], "stats": stats.__dict__})
+        motifs = self.receptor.summarize_escape_motifs(top_k=5)
+        return PhaseSummary(
+            phase="phase2",
+            episodes=episodes,
+            metrics={
+                "escape_motifs": motifs,
+                "binding_site_counter_strategies": [
+                    "increase receptor loop flexibility within functionality floor",
+                    "shift dominant contact sites away from the frozen ligand centroid",
+                    "reuse high-diversity mutations as hard negatives for the ligand learner",
+                ],
+                "hard_negative_count": len(self.base_trainer.ligand_agent.hard_negatives),
+                "flow_events": len(self.flow_history),
+            },
         )
-
-        self._metrics: list[dict[str, Any]] = []
-
-    def _compute_disruption(self, receptor_vec: NDArray) -> float:
-        """Measure how much the mutation disrupts the frozen ligand's binding."""
-        total = 0.0
-        for _ in range(self.probe_steps):
-            obs = np.concatenate([receptor_vec, [0.5, 0.0]])
-            ligand = self.frozen_ligand.act(obs, deterministic=True)
-            score = self.oracle.score(ligand, receptor_vec)
-            total += (1.0 - score)
-        return total / self.probe_steps
-
-    def train(self, callback: Any = None) -> list[dict[str, Any]]:
-        for ep in range(1, self.episodes + 1):
-            ep_metrics = self._run_episode(ep)
-            self._metrics.append(ep_metrics)
-            if callback:
-                callback(ep, ep_metrics)
-        return self._metrics
-
-    def _run_episode(self, episode: int) -> dict[str, Any]:
-        self.receptor_state.reset(self._rng)
-
-        probes = self.frozen_ligand.get_probe_readings(
-            self.receptor_state.vector, self.probe_steps, self.oracle
-        )
-        obs = np.concatenate([self.receptor_state.vector, probes])
-
-        mutation = self.escape_agent.act(obs)
-        self.receptor_state.mutate(mutation)
-
-        disruption = self._compute_disruption(self.receptor_state.vector)
-        learn_info = self.escape_agent.learn(obs, mutation, disruption)
-
-        return {
-            "episode": episode,
-            "disruption": disruption,
-            "receptor_displacement": self.receptor_state.displacement_from_wildtype,
-            **learn_info,
-        }
-
-    @property
-    def metrics(self) -> list[dict[str, Any]]:
-        return list(self._metrics)
-
-    @property
-    def hard_negatives(self) -> list[NDArray]:
-        return self.escape_agent.get_hard_negatives()

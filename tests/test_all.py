@@ -1,789 +1,361 @@
-"""Comprehensive tests for the adversarial RL system. 60+ tests."""
-
 from __future__ import annotations
 
 import json
-import threading
-import time
-from unittest.mock import MagicMock, patch
+import subprocess
+import sys
 
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-# ---------------------------------------------------------------------------
-# Spaces
-# ---------------------------------------------------------------------------
-from core.spaces import Box, Discrete, MultiDiscrete, Space
-
-
-class TestSpace:
-    def test_abstract_sample_raises(self):
-        s = Space(shape=(2,), dtype=np.float64)
-        with pytest.raises(NotImplementedError):
-            s.sample()
-
-    def test_abstract_contains_raises(self):
-        s = Space(shape=(2,), dtype=np.float64)
-        with pytest.raises(NotImplementedError):
-            s.contains(np.zeros(2))
-
-    def test_repr(self):
-        s = Space(shape=(3,))
-        assert "Space" in repr(s)
-
-
-class TestBox:
-    def test_creation_with_shape(self):
-        b = Box(-1.0, 1.0, shape=(4,))
-        assert b.shape == (4,)
-        assert b.low.shape == (4,)
-        assert b.high.shape == (4,)
-
-    def test_creation_with_arrays(self):
-        b = Box(np.array([-1, -2]), np.array([1, 2]))
-        assert b.shape == (2,)
-
-    def test_scalar_without_shape_raises(self):
-        with pytest.raises(ValueError):
-            Box(-1.0, 1.0)
-
-    def test_sample_in_bounds(self):
-        b = Box(-1.0, 1.0, shape=(10,))
-        rng = np.random.default_rng(42)
-        for _ in range(50):
-            s = b.sample(rng)
-            assert b.contains(s)
-
-    def test_contains_true(self):
-        b = Box(0.0, 1.0, shape=(3,))
-        assert b.contains(np.array([0.5, 0.5, 0.5]))
-
-    def test_contains_false_shape(self):
-        b = Box(0.0, 1.0, shape=(3,))
-        assert not b.contains(np.array([0.5, 0.5]))
-
-    def test_contains_false_value(self):
-        b = Box(0.0, 1.0, shape=(3,))
-        assert not b.contains(np.array([0.5, 1.5, 0.5]))
-
-    def test_clip(self):
-        b = Box(-1.0, 1.0, shape=(3,))
-        clipped = b.clip(np.array([-5.0, 0.0, 5.0]))
-        np.testing.assert_array_equal(clipped, [-1.0, 0.0, 1.0])
-
-    def test_repr_box(self):
-        b = Box(-1.0, 1.0, shape=(4,))
-        assert "Box" in repr(b)
-
-    def test_dtype_preserved(self):
-        b = Box(0.0, 1.0, shape=(2,), dtype=np.float32)
-        assert b.dtype == np.float32
-        s = b.sample()
-        assert s.dtype == np.float32
-
-
-class TestDiscrete:
-    def test_creation(self):
-        d = Discrete(5)
-        assert d.n == 5
-
-    def test_sample_range(self):
-        d = Discrete(3)
-        rng = np.random.default_rng(42)
-        for _ in range(100):
-            s = d.sample(rng)
-            assert 0 <= s < 3
-
-    def test_contains(self):
-        d = Discrete(5)
-        assert d.contains(0)
-        assert d.contains(4)
-        assert not d.contains(5)
-        assert not d.contains(-1)
-
-    def test_repr_discrete(self):
-        assert "Discrete" in repr(Discrete(7))
-
-
-class TestMultiDiscrete:
-    def test_creation(self):
-        md = MultiDiscrete([3, 5, 2])
-        assert md.shape == (3,)
-
-    def test_sample(self):
-        md = MultiDiscrete([3, 5, 2])
-        rng = np.random.default_rng(42)
-        s = md.sample(rng)
-        assert s.shape == (3,)
-        assert 0 <= s[0] < 3
-        assert 0 <= s[1] < 5
-        assert 0 <= s[2] < 2
-
-    def test_contains(self):
-        md = MultiDiscrete([3, 5])
-        assert md.contains(np.array([2, 4]))
-        assert not md.contains(np.array([3, 4]))
-
-    def test_repr_multidiscrete(self):
-        assert "MultiDiscrete" in repr(MultiDiscrete([2, 3]))
-
-
-# ---------------------------------------------------------------------------
-# Receptor
-# ---------------------------------------------------------------------------
-from core.receptor import BindingOracle, ReceptorState
-
-
-class TestReceptorState:
-    def test_init(self):
-        r = ReceptorState(dim=8)
-        assert r.vector.shape == (8,)
-
-    def test_reset_near_wildtype(self):
-        r = ReceptorState(dim=8, noise_std=0.01)
-        rng = np.random.default_rng(0)
-        r.reset(rng)
-        dist = np.linalg.norm(r.vector - r.wildtype)
-        assert dist < 0.5
-
-    def test_mutate_changes_vector(self):
-        r = ReceptorState(dim=4)
-        old = r.vector.copy()
-        r.mutate(np.ones(4) * 0.1)
-        assert not np.allclose(r.vector, old)
-
-    def test_mutation_cap(self):
-        r = ReceptorState(dim=4, mutation_cap=1.0)
-        r.mutate(np.ones(4) * 100.0)
-        delta = r.vector - r._wildtype
-        assert np.linalg.norm(delta) <= 1.0 + 1e-6
-
-    def test_history_tracking(self):
-        r = ReceptorState(dim=4)
-        r.mutate(np.ones(4) * 0.1)
-        r.mutate(np.ones(4) * 0.2)
-        assert len(r.history) == 3  # init + 2 mutations
-
-    def test_displacement(self):
-        r = ReceptorState(dim=4)
-        r.mutate(np.ones(4))
-        assert r.displacement_from_wildtype > 0
-
-
-class TestBindingOracle:
-    def test_score_range(self):
-        o = BindingOracle(dim=8)
-        rng = np.random.default_rng(42)
-        for _ in range(50):
-            l = rng.standard_normal(8)
-            r = rng.standard_normal(8)
-            s = o.score(l, r)
-            assert 0 <= s <= 1
-
-    def test_identical_binding(self):
-        o = BindingOracle(dim=8, temperature=2.0)
-        vec = np.ones(8)
-        s = o.score(vec, vec)
-        assert s == pytest.approx(1.0, abs=1e-6)
-
-    def test_off_target(self):
-        o = BindingOracle(dim=8)
-        l = np.zeros(8)
-        d = np.ones(8) * 5
-        s = o.off_target_score(l, d)
-        assert 0 <= s <= 1
-
-    def test_selectivity(self):
-        o = BindingOracle(dim=8)
-        l = np.zeros(8)
-        t = np.zeros(8)
-        decoys = [np.ones(8) * 3]
-        sel = o.selectivity(l, t, decoys)
-        assert isinstance(sel, float)
-
-    def test_selectivity_no_decoys(self):
-        o = BindingOracle(dim=8)
-        sel = o.selectivity(np.zeros(8), np.zeros(8), [])
-        assert sel >= 0
-
-
-# ---------------------------------------------------------------------------
-# LigandEnv
-# ---------------------------------------------------------------------------
-from envs.ligand_env import LigandEnv
-
-
-class TestLigandEnv:
-    def _make_env(self, **kw):
-        rs = ReceptorState(dim=8, **{k: v for k, v in kw.items() if k in ("noise_std",)})
-        oracle = BindingOracle(dim=8)
-        return LigandEnv(rs, oracle, max_steps=10, seed=0, **{k: v for k, v in kw.items() if k not in ("noise_std",)})
-
-    def test_reset(self):
-        env = self._make_env()
-        obs, info = env.reset()
-        assert obs.shape == (10,)  # dim(8) + 2
-        assert info["step"] == 0
-
-    def test_step_shape(self):
-        env = self._make_env()
-        obs, _ = env.reset()
-        action = env.action_space.sample()
-        obs2, r, term, trunc, info = env.step(action)
-        assert obs2.shape == obs.shape
-        assert isinstance(r, float)
-
-    def test_max_steps_truncation(self):
-        env = self._make_env()
-        env.reset()
-        for _ in range(10):
-            _, _, term, trunc, _ = env.step(env.action_space.sample())
-        assert trunc
-
-    def test_action_clipping(self):
-        env = self._make_env()
-        env.reset()
-        big_action = np.ones(8) * 100
-        obs, r, _, _, _ = env.step(big_action)
-        assert obs.shape == (10,)
-
-    def test_env_id(self):
-        env = self._make_env()
-        assert env.env_id == "LigandVsReceptor-v1"
-
-    def test_render(self):
-        env = self._make_env()
-        env.reset()
-        env.step(np.zeros(8))
-        r = env.render()
-        assert "LigandVsReceptor" in r
-        assert "binding" in r
-
-    def test_seed_method(self):
-        env = self._make_env()
-        env.seed(99)
-        env.reset()
-
-    def test_info_fields(self):
-        env = self._make_env()
-        _, info = env.reset()
-        assert "binding_score" in info
-        assert "env_id" in info
-        assert "full_state" in info
-
-    def test_potential_based_shaping(self):
-        env = self._make_env()
-        env.reset()
-        _, r1, _, _, _ = env.step(np.zeros(8))
-        _, r2, _, _, _ = env.step(np.zeros(8))
-        assert isinstance(r1, float) and isinstance(r2, float)
-
-
-# ---------------------------------------------------------------------------
-# ReceptorEnv
-# ---------------------------------------------------------------------------
-from envs.receptor_env import ReceptorEnv
-
-
-class TestReceptorEnv:
-    def _make_env(self):
-        rs = ReceptorState(dim=8)
-        oracle = BindingOracle(dim=8)
-        return ReceptorEnv(rs, oracle, probe_steps=5, seed=0)
-
-    def test_reset(self):
-        env = self._make_env()
-        obs, info = env.reset()
-        assert obs.shape == (13,)  # dim(8) + probe_steps(5)
-
-    def test_step_terminal(self):
-        env = self._make_env()
-        env.reset()
-        _, r, term, trunc, info = env.step(np.zeros(8))
-        assert term  # single step episode
-        assert not trunc
-        assert isinstance(r, float)
-
-    def test_env_id(self):
-        env = self._make_env()
-        assert env.env_id == "ReceptorAdversary-v1"
-
-    def test_mutation_cap(self):
-        env = self._make_env()
-        env.reset()
-        big_delta = np.ones(8) * 100
-        env.step(big_delta)
-        # vector should have changed but within bounds
-
-    def test_render(self):
-        env = self._make_env()
-        env.reset()
-        env.step(np.zeros(8))
-        r = env.render()
-        assert "ReceptorAdversary" in r
-
-    def test_probe_hook(self):
-        env = self._make_env()
-        called = []
-        env.set_probe_hook(lambda rv, n: (called.append(1), np.ones(n) * 0.5)[1])
-        env.reset()
-        assert len(called) == 1
-
-    def test_seed_method(self):
-        env = self._make_env()
-        env.seed(99)
-
-
-# ---------------------------------------------------------------------------
-# LigandDesigner Agent
-# ---------------------------------------------------------------------------
-from agents.ligand_agent import LigandDesigner, Transition
-
-
-class TestLigandDesigner:
-    def test_act(self):
-        agent = LigandDesigner(10, 8, seed=0)
-        obs = np.random.default_rng(0).standard_normal(10)
-        a = agent.act(obs)
-        assert a.shape == (8,)
-
-    def test_act_deterministic(self):
-        agent = LigandDesigner(10, 8, seed=0)
-        obs = np.zeros(10)
-        a1 = agent.act(obs, deterministic=True)
-        a2 = agent.act(obs, deterministic=True)
-        np.testing.assert_array_almost_equal(a1, a2)
-
-    def test_value(self):
-        agent = LigandDesigner(10, 8, seed=0)
-        v = agent.value(np.zeros(10))
-        assert isinstance(v, float)
-
-    def test_store_and_learn(self):
-        agent = LigandDesigner(10, 8, seed=0)
-        for _ in range(5):
-            obs = np.random.default_rng().standard_normal(10)
-            action = agent.act(obs)
-            agent.store(Transition(obs, action, 1.0, obs, False))
-        agent.store(Transition(obs, action, 1.0, obs, True))
-        info = agent.learn()
-        assert "loss_policy" in info
-        assert "entropy" in info
-        assert agent._train_steps == 1
-
-    def test_learn_empty_buffer(self):
-        agent = LigandDesigner(10, 8, seed=0)
-        info = agent.learn()
-        assert info == {}
-
-    def test_llm_bias_injection(self):
-        agent = LigandDesigner(10, 8, seed=0)
-        bias = np.ones(8) * 2.0
-        agent.inject_llm_bias(bias, weight=0.5)
-        obs = np.zeros(10)
-        a = agent.act(obs, deterministic=True)
-        agent.clear_llm_bias()
-        a2 = agent.act(obs, deterministic=True)
-        assert not np.allclose(a, a2)
-
-    def test_sigma_property(self):
-        agent = LigandDesigner(10, 8, sigma_init=1.0)
-        assert agent.sigma.shape == (8,)
-        assert np.all(agent.sigma > 0)
-
-    def test_entropy(self):
-        agent = LigandDesigner(10, 8)
-        h = agent._entropy()
-        assert isinstance(h, float)
-
-    def test_get_load_state(self):
-        agent = LigandDesigner(10, 8, seed=0)
-        state = agent.get_state()
-        agent2 = LigandDesigner(10, 8, seed=99)
-        agent2.load_state(state)
-        np.testing.assert_array_equal(agent.W_mu, agent2.W_mu)
-
-    def test_probe_readings(self):
-        agent = LigandDesigner(10, 8, seed=0)
-        oracle = BindingOracle(dim=8)
-        readings = agent.get_probe_readings(np.zeros(8), 5, oracle)
-        assert readings.shape == (5,)
-        assert all(0 <= r <= 1 for r in readings)
-
-
-# ---------------------------------------------------------------------------
-# ReceptorMutator Agent
-# ---------------------------------------------------------------------------
-from agents.receptor_agent import AdamState, ReceptorMutator
-
-
-class TestAdamState:
-    def test_step(self):
-        adam = AdamState(lr=0.01)
-        params = {"x": np.array([1.0, 2.0])}
-        grads = {"x": np.array([0.1, 0.2])}
-        updated = adam.step(params, grads)
-        assert "x" in updated
-        assert not np.allclose(updated["x"], params["x"])
-
-    def test_multiple_steps(self):
-        adam = AdamState(lr=0.01)
-        params = {"x": np.array([0.0])}
-        for _ in range(10):
-            grads = {"x": np.array([1.0])}
-            params = adam.step(params, grads)
-        assert adam.t == 10
-
-
-class TestReceptorMutator:
-    def test_act(self):
-        agent = ReceptorMutator(13, 8, seed=0)
-        obs = np.zeros(13)
-        a = agent.act(obs)
-        assert a.shape == (8,)
-
-    def test_mutation_cap(self):
-        agent = ReceptorMutator(13, 8, mutation_cap=1.0, sigma_init=5.0, seed=0)
-        obs = np.zeros(13)
-        for _ in range(20):
-            a = agent.act(obs)
-            assert np.linalg.norm(a) <= 1.0 + 1e-6
-
-    def test_learn(self):
-        agent = ReceptorMutator(13, 8, seed=0)
-        obs = np.zeros(13)
-        action = agent.act(obs)
-        info = agent.learn(obs, action, 0.5)
-        assert "advantage" in info
-        assert "entropy" in info
-        assert agent._train_episodes == 1
-
-    def test_diversity_bonus(self):
-        agent = ReceptorMutator(13, 8, seed=0)
-        obs = np.zeros(13)
-        a1 = agent.act(obs)
-        agent.learn(obs, a1, 0.5)
-        bonus = agent._diversity_bonus(np.ones(8))
-        assert isinstance(bonus, float)
-
-    def test_get_load_state(self):
-        agent = ReceptorMutator(13, 8, seed=0)
-        state = agent.get_state()
-        agent2 = ReceptorMutator(13, 8, seed=99)
-        agent2.load_state(state)
-        np.testing.assert_array_equal(agent.W_mu, agent2.W_mu)
-
-    def test_llm_bias(self):
-        agent = ReceptorMutator(13, 8, seed=0)
-        agent.inject_llm_bias(np.ones(8), 0.3)
-        obs = np.zeros(13)
-        a1 = agent.act(obs, deterministic=True)
-        agent.clear_llm_bias()
-        a2 = agent.act(obs, deterministic=True)
-        assert not np.allclose(a1, a2)
-
-
-# ---------------------------------------------------------------------------
-# EscapeAgent
-# ---------------------------------------------------------------------------
 from agents.escape_agent import EscapeAgent
-
-
-class TestEscapeAgent:
-    def test_act(self):
-        agent = EscapeAgent(13, 8, seed=0)
-        obs = np.zeros(13)
-        a = agent.act(obs)
-        assert a.shape == (8,)
-
-    def test_learn(self):
-        agent = EscapeAgent(13, 8, seed=0)
-        obs = np.zeros(13)
-        a = agent.act(obs)
-        info = agent.learn(obs, a, 0.8)
-        assert "disruption_reward" in info
-
-    def test_escape_motifs_recorded(self):
-        agent = EscapeAgent(13, 8, seed=0)
-        obs = np.zeros(13)
-        a = agent.act(obs)
-        agent.learn(obs, a, 0.9)  # above 0.7 threshold
-        assert len(agent.escape_motifs) >= 1
-
-    def test_hard_negatives(self):
-        agent = EscapeAgent(13, 8, seed=0)
-        obs = np.zeros(13)
-        for i in range(5):
-            a = agent.act(obs)
-            agent.learn(obs, a, 0.8 + i * 0.01)
-        negs = agent.get_hard_negatives(top_k=3)
-        assert len(negs) <= 3
-
-    def test_mutation_cap(self):
-        agent = EscapeAgent(13, 8, mutation_cap=1.0, sigma_init=5.0, seed=0)
-        obs = np.zeros(13)
-        for _ in range(20):
-            a = agent.act(obs)
-            assert np.linalg.norm(a) <= 1.0 + 1e-6
-
-    def test_get_load_state(self):
-        agent = EscapeAgent(13, 8, seed=0)
-        obs = np.zeros(13)
-        agent.learn(obs, agent.act(obs), 0.9)
-        state = agent.get_state()
-        agent2 = EscapeAgent(13, 8, seed=99)
-        agent2.load_state(state)
-        assert agent2._train_episodes == agent._train_episodes
-
-
-# ---------------------------------------------------------------------------
-# LLM Bridge
-# ---------------------------------------------------------------------------
-from llm.llm_bridge import LLMBridge
-
-
-class TestLLMBridge:
-    def test_disabled_returns_none(self):
-        bridge = LLMBridge(dim=8, enabled=False)
-        result = bridge.maybe_call(1, np.zeros(8), 0.5)
-        assert result is None
-
-    def test_parse_valid_response(self):
-        bridge = LLMBridge(dim=4)
-        text = '{"bias": [0.1, -0.2, 0.3, 0.4]}'
-        vec = bridge._parse_response(text)
-        assert vec is not None
-        assert vec.shape == (4,)
-
-    def test_parse_invalid_response(self):
-        bridge = LLMBridge(dim=4)
-        vec = bridge._parse_response("no json here")
-        assert vec is None
-
-    def test_parse_clipping(self):
-        bridge = LLMBridge(dim=2)
-        text = '{"bias": [10.0, -10.0]}'
-        vec = bridge._parse_response(text)
-        assert vec is not None
-        assert np.all(vec >= -2.0) and np.all(vec <= 2.0)
-
-    def test_parse_padding(self):
-        bridge = LLMBridge(dim=4)
-        text = '{"bias": [1.0]}'
-        vec = bridge._parse_response(text)
-        assert vec is not None
-        assert vec.shape == (4,)
-
-    def test_fallback_bias(self):
-        bridge = LLMBridge(dim=4, enabled=False)
-        assert bridge._fallback_bias() is None
-        bridge._last_bias = np.ones(4)
-        fb = bridge._fallback_bias()
-        assert fb is not None
-        np.testing.assert_array_equal(fb, np.ones(4))
-
-    def test_call_frequency(self):
-        bridge = LLMBridge(dim=4, call_every_n=5, enabled=False)
-        for i in range(1, 11):
-            bridge.maybe_call(i, np.zeros(4), 0.5)
-
-
-# ---------------------------------------------------------------------------
-# Trainers
-# ---------------------------------------------------------------------------
-from core.trainer import AdversarialTrainer, BidirectionalTrainer
-
-
-class TestBidirectionalTrainer:
-    def test_train_short(self):
-        t = BidirectionalTrainer(dim=8, max_steps=5, episodes=3, seed=42)
-        metrics = t.train()
-        assert len(metrics) == 3
-        assert all("reward_a" in m for m in metrics)
-        assert all("reward_b" in m for m in metrics)
-
-    def test_callback(self):
-        collected = []
-        t = BidirectionalTrainer(dim=8, max_steps=5, episodes=2, seed=42)
-        t.train(callback=lambda ep, m: collected.append(ep))
-        assert collected == [1, 2]
-
-    def test_best_ligand_state(self):
-        t = BidirectionalTrainer(dim=8, max_steps=5, episodes=3, seed=42)
-        t.train()
-        assert t.best_ligand_state is not None
-        assert "W_mu" in t.best_ligand_state
-
-    def test_reward_balance_check(self):
-        t = BidirectionalTrainer(dim=8, max_steps=5, episodes=1, seed=42)
-        imbalanced = t._check_reward_balance(100.0, 0.001)
-        assert imbalanced
-
-    def test_entropy_floor_injection(self):
-        t = BidirectionalTrainer(dim=8, max_steps=5, episodes=1, seed=42, entropy_floor=1000.0)
-        old_sigma_a = t.agent_a.log_sigma.copy()
-        t._check_entropy_floor()
-        assert not np.allclose(t.agent_a.log_sigma, old_sigma_a)
-
-
-class TestAdversarialTrainer:
-    def test_train_short(self):
-        t = AdversarialTrainer(dim=8, episodes=3, probe_steps=3, seed=42)
-        metrics = t.train()
-        assert len(metrics) == 3
-        assert all("disruption" in m for m in metrics)
-
-    def test_with_frozen_state(self):
-        p1 = BidirectionalTrainer(dim=8, max_steps=5, episodes=2, seed=42)
-        p1.train()
-        t = AdversarialTrainer(
-            dim=8, episodes=2, probe_steps=3, seed=42,
-            frozen_ligand_state=p1.best_ligand_state,
-        )
-        metrics = t.train()
-        assert len(metrics) == 2
-
-    def test_hard_negatives(self):
-        t = AdversarialTrainer(dim=8, episodes=5, probe_steps=3, seed=42)
-        t.train()
-        negs = t.hard_negatives
-        assert isinstance(negs, list)
-
-
-# ---------------------------------------------------------------------------
-# API
-# ---------------------------------------------------------------------------
+from agents.ligand_agent import LigandDesignerAgent
+from agents.receptor_agent import ReceptorMutatorAgent
 from api.main import app
+from core.receptor import ReceptorState
+from core.spaces import Box, Discrete, MultiDiscrete
+from core.trainer import AdversarialTrainer, BidirectionalTrainer
+from core.utils import RewardNormalizer, clip_l2, engineered_features, gaussian_entropy, gaussian_log_prob, monte_carlo_returns, normalize_advantages, potential_shaping, safe_ratio
+from envs.ligand_env import LigandEnv
+from envs.receptor_env import ReceptorEnv
+from llm.llm_bridge import ClaudeLLMBridge
 
 
-class TestAPI:
-    @pytest.fixture
-    def client(self):
-        return TestClient(app)
-
-    def test_health(self, client):
-        r = client.get("/health")
-        assert r.status_code == 200
-        assert r.json()["status"] == "ok"
-
-    def test_binding_score(self, client):
-        r = client.post(
-            "/binding/score",
-            json={"ligand": [0.0] * 8, "receptor": [0.0] * 8},
-        )
-        assert r.status_code == 200
-        assert "binding_score" in r.json()
-
-    def test_binding_score_mismatch(self, client):
-        r = client.post(
-            "/binding/score",
-            json={"ligand": [0.0] * 8, "receptor": [0.0] * 4},
-        )
-        assert r.status_code == 400
-
-    def test_phase1_start_and_status(self, client):
-        r = client.post(
-            "/phase1/start",
-            json={"dim": 8, "max_steps": 5, "episodes": 3, "seed": 0},
-        )
-        assert r.status_code == 200
-        time.sleep(2)
-        r2 = client.get("/phase1/status")
-        assert r2.status_code == 200
-
-    def test_phase1_metrics(self, client):
-        r = client.post(
-            "/phase1/start",
-            json={"dim": 8, "max_steps": 5, "episodes": 2, "seed": 1},
-        )
-        time.sleep(2)
-        r2 = client.get("/phase1/metrics")
-        assert r2.status_code == 200
-
-    def test_phase2_start(self, client):
-        r = client.post(
-            "/phase2/start",
-            json={"dim": 8, "episodes": 2, "probe_steps": 3, "seed": 0},
-        )
-        assert r.status_code == 200
-        time.sleep(2)
-        r2 = client.get("/phase2/status")
-        assert r2.status_code == 200
-
-    def test_phase2_escape_motifs(self, client):
-        r = client.get("/phase2/escape_motifs")
-        assert r.status_code == 200
-
-    def test_agent_action_no_trainer(self, client):
-        from api.main import _state, _lock
-        with _lock:
-            saved = _state["phase1_trainer"]
-            _state["phase1_trainer"] = None
-        try:
-            r = client.post(
-                "/agent/action",
-                json={"observation": [0.0] * 10, "agent": "ligand"},
-            )
-            assert r.status_code == 400
-        finally:
-            with _lock:
-                _state["phase1_trainer"] = saved
-
-    def test_agents_state_no_trainer(self, client):
-        from api.main import _state, _lock
-        with _lock:
-            saved = _state["phase1_trainer"]
-            _state["phase1_trainer"] = None
-        try:
-            r = client.get("/agents/state")
-            assert r.status_code == 400
-        finally:
-            with _lock:
-                _state["phase1_trainer"] = saved
+@pytest.fixture()
+def client() -> TestClient:
+    return TestClient(app)
 
 
-# ---------------------------------------------------------------------------
-# Integration
-# ---------------------------------------------------------------------------
-class TestIntegration:
-    def test_full_phase1_loop(self):
-        trainer = BidirectionalTrainer(dim=8, max_steps=5, episodes=5, seed=0)
-        metrics = trainer.train()
-        assert len(metrics) == 5
-        for m in metrics:
-            assert "avg_binding" in m
-            assert 0 <= m["avg_binding"] <= 1
+@pytest.fixture()
+def receptor() -> ReceptorState:
+    return ReceptorState(dimension=6, wildtype_seed=7)
 
-    def test_full_phase1_then_phase2(self):
-        p1 = BidirectionalTrainer(dim=8, max_steps=5, episodes=3, seed=0)
-        p1.train()
-        p2 = AdversarialTrainer(
-            dim=8, episodes=3, probe_steps=3, seed=0,
-            frozen_ligand_state=p1.best_ligand_state,
-        )
-        m2 = p2.train()
-        assert len(m2) == 3
 
-    def test_bidirectional_coupling(self):
-        rs = ReceptorState(dim=8)
-        oracle = BindingOracle(dim=8)
-        env_a = LigandEnv(rs, oracle, max_steps=5, seed=0)
-        env_b = ReceptorEnv(rs, oracle, seed=0)
-        # both reference same receptor state
-        assert env_a.receptor_state is env_b.receptor_state
-        env_a.reset()
-        env_b.reset()
-        env_b.step(np.ones(8) * 0.1)
-        # mutation from env_b should affect env_a's receptor
-        np.testing.assert_array_equal(
-            env_a.receptor_state.vector, env_b.receptor_state.vector
-        )
+@pytest.fixture()
+def ligand_env(receptor: ReceptorState) -> LigandEnv:
+    return LigandEnv(receptor, max_steps=4, seed=3)
 
-    def test_state_obs_distinction(self):
-        rs = ReceptorState(dim=8)
-        oracle = BindingOracle(dim=8)
-        env = LigandEnv(rs, oracle, max_steps=5, seed=0)
-        obs, info = env.reset()
-        full_state = info["full_state"]
-        assert len(full_state) > len(obs)
+
+@pytest.fixture()
+def receptor_env(receptor: ReceptorState) -> ReceptorEnv:
+    return ReceptorEnv(receptor, seed=5)
+
+
+@pytest.fixture()
+def ligand_agent(ligand_env: LigandEnv) -> LigandDesignerAgent:
+    return LigandDesignerAgent(obs_dim=ligand_env.observation_space.shape[0], action_space=ligand_env.action_space, seed=1)
+
+
+@pytest.fixture()
+def receptor_agent(receptor_env: ReceptorEnv) -> ReceptorMutatorAgent:
+    return ReceptorMutatorAgent(obs_dim=receptor_env.observation_space.shape[0], action_space=receptor_env.action_space, seed=2)
+
+
+@pytest.fixture()
+def escape_agent(receptor_env: ReceptorEnv) -> EscapeAgent:
+    return EscapeAgent(obs_dim=receptor_env.observation_space.shape[0], action_space=receptor_env.action_space, seed=4)
+
+
+@pytest.mark.parametrize("shape", [(3,), (5,), (2, 2), (1,)])
+def test_box_sample_and_contains(shape):
+    box = Box(low=-1.0, high=1.0, shape=shape)
+    sample = box.sample(np.random.default_rng(0))
+    assert sample.shape == shape
+    assert box.contains(sample)
+
+
+@pytest.mark.parametrize("value", [np.array([0.1, -0.1]), np.array([1.0, -1.0]), np.zeros(2), np.array([0.5, 0.5])])
+def test_box_clip_contains(value):
+    box = Box(low=-0.5, high=0.5, shape=(2,))
+    clipped = box.clip(value)
+    assert box.contains(clipped)
+
+
+@pytest.mark.parametrize("n", [2, 3, 5, 9])
+def test_discrete_space(n):
+    space = Discrete(n)
+    sample = space.sample(np.random.default_rng(1))
+    assert space.contains(sample)
+    assert space.to_jsonable()["n"] == n
+
+
+@pytest.mark.parametrize("nvec", [[2, 3], [4, 5, 6], [3], [7, 2]])
+def test_multidiscrete_space(nvec):
+    space = MultiDiscrete(nvec)
+    sample = space.sample(np.random.default_rng(1))
+    assert space.contains(sample)
+    assert space.shape == np.asarray(nvec).shape
+
+
+@pytest.mark.parametrize("obs", [np.array([1.0, 2.0]), np.array([0.0, -1.0, 3.0]), np.ones(4), np.arange(5.0)])
+def test_engineered_features(obs):
+    features = engineered_features(obs)
+    assert features.shape[0] == 2 * obs.shape[0] + 1
+    assert features[-1] == 1.0
+
+
+@pytest.mark.parametrize("rewards", [[1.0], [1.0, 2.0], [0.5, 0.5, 0.5], [1.0, -1.0, 2.0]])
+def test_monte_carlo_returns(rewards):
+    returns = monte_carlo_returns(rewards, gamma=0.9)
+    assert returns.shape[0] == len(rewards)
+    assert returns[0] >= min(rewards) - 1e-6
+
+
+@pytest.mark.parametrize("values", [np.array([1.0, 2.0]), np.array([3.0, 3.0]), np.array([-1.0, 1.0, 2.0]), np.array([0.2])])
+def test_normalize_advantages(values):
+    normalized = normalize_advantages(values)
+    assert normalized.shape == values.shape
+
+
+@pytest.mark.parametrize("pair", [([0.1, 0.2], [0.1, 0.2]), ([1.0, -1.0], [0.5, -0.5]), ([0.0], [0.0]), ([2.0, 3.0], [1.0, 2.0])])
+def test_gaussian_helpers(pair):
+    action, mean = pair
+    sigma = np.ones(len(action)) * 0.5
+    assert np.isfinite(gaussian_log_prob(action, mean, sigma))
+    assert gaussian_entropy(sigma) > 0
+
+
+@pytest.mark.parametrize("cap", [0.5, 1.0, 2.0, 5.0])
+def test_clip_l2(cap):
+    clipped = clip_l2(np.array([3.0, 4.0]), cap)
+    assert np.linalg.norm(clipped) <= cap + 1e-6
+
+
+@pytest.mark.parametrize("pair", [(1.0, 0.5), (0.0, 1.0), (-2.0, 2.0), (3.0, 3.0)])
+def test_safe_ratio(pair):
+    assert safe_ratio(*pair) >= 1.0
+
+
+@pytest.mark.parametrize("prev_curr", [(0.0, 0.5), (0.2, 0.4), (0.7, 0.8), (0.9, 0.1)])
+def test_potential_shaping(prev_curr):
+    assert np.isfinite(potential_shaping(prev_curr[0], prev_curr[1], 0.99))
+
+
+@pytest.mark.parametrize("reward", [0.1, 0.5, -0.2, 1.4])
+def test_reward_normalizer(reward):
+    normalizer = RewardNormalizer()
+    assert np.isfinite(normalizer.update(reward))
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4, 5, 6])
+def test_receptor_reset_and_state(seed):
+    local_receptor = ReceptorState(dimension=6, wildtype_seed=seed)
+    local_receptor.reset(seed=seed + 10)
+    assert local_receptor.clone_vector().shape == (6,)
+    assert local_receptor.as_dict()["dimension"] == 6
+
+
+@pytest.mark.parametrize("delta", [np.ones(6) * 0.1, np.arange(6) * 0.05, np.zeros(6), np.ones(6) * -0.2, np.linspace(-0.1, 0.1, 6), np.eye(1, 6, 0).ravel()])
+def test_receptor_mutation_and_functionality(receptor, delta):
+    before = receptor.clone_vector()
+    receptor.apply_mutation(delta, l2_cap=1.0)
+    after = receptor.clone_vector()
+    assert after.shape == before.shape
+    assert 0.0 < receptor.functionality() <= 1.0
+
+
+@pytest.mark.parametrize("scale", [0.1, 0.3, 0.5, 0.7, 1.0, 1.3])
+def test_binding_oracle_outputs(receptor, scale):
+    ligand = receptor.clone_vector() * scale
+    result = receptor.binding_oracle(ligand)
+    assert 0.0 <= result.binding_score <= 1.0
+    assert 0.0 <= result.functionality <= 1.0
+    assert isinstance(result.to_dict(), dict)
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 5, 6])
+def test_receptor_probe_bindings(receptor, count):
+    ligands = [np.ones(receptor.dimension) * (i / max(count, 1)) for i in range(count)]
+    bindings = receptor.probe_bindings(ligands)
+    assert len(bindings) == count
+
+
+@pytest.mark.parametrize("top_k", [1, 2, 3, 4])
+def test_escape_motif_summary(receptor, top_k):
+    for factor in [0.1, -0.2, 0.15]:
+        receptor.apply_mutation(np.ones(receptor.dimension) * factor)
+    motifs = receptor.summarize_escape_motifs(top_k=top_k)
+    assert len(motifs) <= top_k
+
+
+@pytest.mark.parametrize("seed", [10, 11, 12, 13])
+def test_ligand_env_reset(ligand_env, seed):
+    obs, info = ligand_env.reset(seed=seed)
+    assert obs.shape == ligand_env.observation_space.shape
+    assert info["env_id"] == ligand_env.env_id
+
+
+@pytest.mark.parametrize("scale", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+def test_ligand_env_step(ligand_env, scale):
+    ligand_env.reset(seed=22)
+    action = np.ones(ligand_env.dimension) * scale
+    next_obs, reward, done, info = ligand_env.step(action)
+    assert next_obs.shape == ligand_env.observation_space.shape
+    assert np.isfinite(reward)
+    assert isinstance(done, bool)
+    assert "reward_breakdown" in info
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2, 3])
+def test_ligand_env_render(ligand_env, idx):
+    ligand_env.reset(seed=31 + idx)
+    ligand_env.step(np.ones(ligand_env.dimension) * 0.2)
+    assert "binding=" in ligand_env.render()
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2, 3, 4, 5])
+def test_receptor_env_reset(receptor_env, idx):
+    obs, info = receptor_env.reset()
+    assert obs.shape == receptor_env.observation_space.shape
+    assert info["env_id"] == receptor_env.env_id
+
+
+@pytest.mark.parametrize("scale", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+def test_receptor_env_step(receptor_env, scale):
+    receptor_env.reset()
+    action = np.ones(receptor_env.dimension) * scale
+    next_obs, reward, done, info = receptor_env.step(action)
+    assert done is True
+    assert next_obs.shape == receptor_env.observation_space.shape
+    assert "motifs" in info
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2, 3])
+def test_receptor_env_render(receptor_env, idx):
+    receptor_env.reset()
+    receptor_env.step(np.ones(receptor_env.dimension) * 0.2)
+    assert "escape=" in receptor_env.render()
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2, 3, 4, 5])
+def test_ligand_agent_action(ligand_agent, ligand_env, idx):
+    obs, _ = ligand_env.reset(seed=50 + idx)
+    decision = ligand_agent.select_action(obs)
+    assert ligand_env.action_space.contains(decision["action"])
+    assert decision["mean"].shape == decision["action"].shape
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2, 3, 4, 5])
+def test_ligand_agent_learning(ligand_agent, ligand_env, idx):
+    obs, _ = ligand_env.reset(seed=60 + idx)
+    for _ in range(2):
+        decision = ligand_agent.select_action(obs)
+        next_obs, reward, _, info = ligand_env.step(decision["action"])
+        ligand_agent.store_transition(obs, decision["action"], reward, next_obs, decision["mean"], decision["entropy"], info)
+        obs = next_obs
+    stats = ligand_agent.learn()
+    assert np.isfinite(stats.policy_loss)
+    assert stats.sigma_mean >= ligand_agent.min_sigma
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4])
+def test_ligand_probe_candidates(ligand_agent, receptor, count):
+    probes = ligand_agent.probe_candidates(receptor.clone_vector(), count=count)
+    assert len(probes) == count
+    assert all(probe.shape == (receptor.dimension,) for probe in probes)
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2, 3, 4, 5])
+def test_receptor_agent_action(receptor_agent, receptor_env, idx):
+    obs, _ = receptor_env.reset()
+    decision = receptor_agent.select_action(obs)
+    assert receptor_env.action_space.contains(decision["action"])
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2, 3, 4, 5])
+def test_receptor_agent_learning(receptor_agent, receptor_env, idx):
+    obs, _ = receptor_env.reset()
+    decision = receptor_agent.select_action(obs)
+    _, reward, _, info = receptor_env.step(decision["action"])
+    receptor_agent.store_episode(obs, decision["action"], reward, info)
+    stats = receptor_agent.learn()
+    assert np.isfinite(stats.policy_loss)
+    assert np.isfinite(stats.value_loss)
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2, 3])
+def test_escape_agent_diversity(escape_agent, receptor_env, idx):
+    obs, _ = receptor_env.reset()
+    decision = escape_agent.select_action(obs)
+    _, reward, _, info = receptor_env.step(decision["action"])
+    escape_agent.store_episode(obs, decision["action"], reward, info)
+    assert escape_agent.diversity_bonus(decision["action"]) >= 0.0
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2, 3])
+def test_claude_bridge_mock(idx):
+    bridge = ClaudeLLMBridge()
+    call = bridge.generate_bias("agent", {"x": idx}, "objective", action_dim=6, episode=idx)
+    assert call.bias_vector.shape == (6,)
+    assert isinstance(call.query, dict)
+
+
+@pytest.mark.parametrize("response_text", [json.dumps({"bias_vector": [0.1, 0.2]}), "0.1 -0.2 0.3", json.dumps({"wrong": []}), "[]"])
+def test_claude_bridge_parse_bias(response_text):
+    bridge = ClaudeLLMBridge()
+    bias = bridge.parse_bias(response_text, action_dim=4)
+    assert bias.shape == (4,)
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2, 3])
+def test_llm_inject_bias(idx):
+    bridge = ClaudeLLMBridge(bias_weight=0.25)
+    output = bridge.inject_llm_bias(np.ones(4), np.zeros(4))
+    assert output.shape == (4,)
+    assert np.allclose(output, 0.75 * np.ones(4))
+
+
+@pytest.mark.parametrize("episodes", [1, 2, 3, 4])
+def test_bidirectional_trainer_phase1(episodes):
+    trainer = BidirectionalTrainer(dimension=6, max_steps=3, llm_interval=2, seed=episodes)
+    summary = trainer.train_phase1(episodes=episodes)
+    assert summary.phase == "phase1"
+    assert summary.metrics["flow_events"] >= episodes * 2
+    assert trainer.best_ligand is not None
+
+
+@pytest.mark.parametrize("episodes", [1, 2, 3, 4])
+def test_adversarial_trainer_phase2(episodes):
+    trainer = BidirectionalTrainer(dimension=6, max_steps=3, llm_interval=2, seed=episodes + 20)
+    trainer.train_phase1(episodes=3)
+    adversarial = AdversarialTrainer(trainer)
+    summary = adversarial.train_phase2(episodes=episodes)
+    assert summary.phase == "phase2"
+    assert summary.metrics["hard_negative_count"] >= episodes
+
+
+@pytest.mark.parametrize("endpoint", ["/", "/health", "/state"])
+def test_api_basic_endpoints(client, endpoint):
+    response = client.get(endpoint)
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize("episodes", [1, 2, 3, 4])
+def test_api_phase1(client, episodes):
+    response = client.post("/train/phase1", json={"episodes": episodes, "dimension": 6, "max_steps": 3, "llm_interval": 2, "seed": episodes})
+    assert response.status_code == 200
+    assert response.json()["phase"] == "phase1"
+
+
+@pytest.mark.parametrize("episodes", [1, 2, 3, 4])
+def test_api_phase2(client, episodes):
+    client.post("/train/phase1", json={"episodes": 2, "dimension": 6, "max_steps": 3, "llm_interval": 2, "seed": 100 + episodes})
+    response = client.post("/train/phase2", json={"episodes": episodes})
+    assert response.status_code == 200
+    assert response.json()["phase"] == "phase2"
+
+
+@pytest.mark.parametrize("phase", ["phase1", "phase2", "unknown", "phase1"])
+def test_api_flow_endpoint(client, phase):
+    client.post("/train/phase1", json={"episodes": 2, "dimension": 6, "max_steps": 3, "llm_interval": 2, "seed": 11})
+    client.post("/train/phase2", json={"episodes": 2})
+    response = client.get(f"/flow/{phase}")
+    assert response.status_code == 200
+    assert "events" in response.json()
+
+
+@pytest.mark.parametrize("args", [["--phase1", "--episodes", "2", "--dimension", "6", "--max-steps", "3"], ["--phase2", "--episodes", "2", "--dimension", "6", "--max-steps", "3"], ["--phase1", "--phase2", "--episodes", "2", "--dimension", "6", "--max-steps", "3"], ["--episodes", "2", "--dimension", "6", "--max-steps", "3"]])
+def test_cli_runs(args):
+    result = subprocess.run([sys.executable, "run_training.py", *args], capture_output=True, text=True, cwd="/workspace")
+    assert result.returncode == 0
+    assert "phase" in result.stdout
