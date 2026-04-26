@@ -8,7 +8,7 @@
     "seed": 42
   },
   "trained_agent": {
-    "eval_binding": 0.1598,
+    "eval_binding": 0.1234,
     "eval_reward": 0.0,
     "eval_selectivity": 0.3221,
     "best_ligand": {
@@ -35,14 +35,14 @@
     "eval_selectivity": 0.0605
   },
   "improvement": {
-    "binding_percent": -54.2,
+    "binding_percent": -64.6,
     "reward_percent": -100.0
   },
   "phase2_escape": {
     "escape_motifs_found": 5,
     "hard_negatives_injected": 60,
-    "mean_disruption": 0.8185,
-    "max_disruption": 0.9773
+    "mean_disruption": 0.8353,
+    "max_disruption": 0.9892
   },
   "flow_pipeline": {
     "description": "input(query) -> agent -> LLM -> openenv -> reward -> biased_output -> repeat",
