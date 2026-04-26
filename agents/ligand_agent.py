@@ -134,6 +134,17 @@ class LigandDesignerAgent:
             self.value_w -= self.lr_value * 2.0 * self.value_alpha * value_error * features
             value_loss += value_error * value_error
 
+        if self.hard_negatives:
+            recent_negatives = self.hard_negatives[-5:]
+            for obs, action in zip(self.memory.observations, self.memory.actions):
+                for neg in recent_negatives:
+                    neg_arr = np.asarray(neg, dtype=np.float64)
+                    if neg_arr.shape == action.shape:
+                        similarity = float(np.dot(action, neg_arr) / (np.linalg.norm(action) * np.linalg.norm(neg_arr) + 1e-8))
+                        if similarity > 0.5:
+                            repulsion = 0.02 * similarity * (action - neg_arr) / (np.linalg.norm(action - neg_arr) + 1e-8)
+                            self.policy_b -= self.lr_policy * repulsion
+
         self.sigma = np.maximum(self.min_sigma, self.sigma * self.sigma_decay)
         entropy = gaussian_entropy(self.sigma) * self.entropy_beta
         reward_mean = float(np.mean(self.memory.rewards))

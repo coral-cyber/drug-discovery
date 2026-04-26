@@ -40,6 +40,9 @@ class ReceptorEnv:
         return probes
 
     def _probe_readings(self) -> list[float]:
+        return self.probe_readings()
+
+    def probe_readings(self) -> list[float]:
         probes = self.probe_hook(self.probe_count) if self.probe_hook is not None else self._default_probes(self.probe_count)
         return self.receptor_state.probe_bindings(probes)
 

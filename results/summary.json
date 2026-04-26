@@ -1,0 +1,56 @@
+{
+  "experiment": {
+    "dimension": 8,
+    "max_steps": 12,
+    "phase1_episodes": 200,
+    "phase2_episodes": 60,
+    "llm_interval": 3,
+    "seed": 42
+  },
+  "trained_agent": {
+    "eval_binding": 0.1598,
+    "eval_reward": 0.0,
+    "eval_selectivity": 0.3221,
+    "best_ligand": {
+      "ligand": [
+        -0.536777,
+        -0.40609,
+        -0.007242,
+        0.761122,
+        0.056631,
+        -0.053153,
+        0.106836,
+        0.568911
+      ],
+      "binding_score": 0.6887582868850914,
+      "selectivity": 0.3221090072495278,
+      "episode": 1
+    },
+    "sigma_start": 0.597,
+    "sigma_end": 0.3224
+  },
+  "random_baseline": {
+    "eval_binding": 0.349,
+    "eval_reward": 3.9212,
+    "eval_selectivity": 0.0605
+  },
+  "improvement": {
+    "binding_percent": -54.2,
+    "reward_percent": -100.0
+  },
+  "phase2_escape": {
+    "escape_motifs_found": 5,
+    "hard_negatives_injected": 60,
+    "mean_disruption": 0.8185,
+    "max_disruption": 0.9773
+  },
+  "flow_pipeline": {
+    "description": "input(query) -> agent -> LLM -> openenv -> reward -> biased_output -> repeat",
+    "openenv_used": [
+      "LigandVsReceptor-v1",
+      "ReceptorAdversary-v1"
+    ],
+    "llm_integration": "Claude API with deterministic mock fallback",
+    "bidirectional_coupling": "shared ReceptorState links both environments"
+  }
+}

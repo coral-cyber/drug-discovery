@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 
 from agents.receptor_agent import ReceptorMutatorAgent
 from core.spaces import Box
@@ -21,10 +20,13 @@ class EscapeAgent(ReceptorMutatorAgent):
         mutation_arr = np.asarray(mutation, dtype=np.float64)
         if not self.escape_archive:
             return 0.1
-        current = mutation_arr.reshape(1, -1)
-        archive = np.vstack(self.escape_archive[-8:])
-        sims = cosine_similarity(current, archive)[0]
-        cosine_distance = float(np.mean(1.0 - sims))
+        norm_current = np.linalg.norm(mutation_arr) + 1e-8
+        normalized_current = mutation_arr / norm_current
+        similarities = []
+        for archived in self.escape_archive[-8:]:
+            norm_archived = np.linalg.norm(archived) + 1e-8
+            similarities.append(float(np.dot(normalized_current, archived / norm_archived)))
+        cosine_distance = float(np.mean(1.0 - np.array(similarities)))
         return max(0.0, cosine_distance) * 0.2
 
     def store_episode(self, obs: np.ndarray, action: np.ndarray, reward: float, info: dict[str, Any]) -> None:
