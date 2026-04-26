@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import numpy as np
 
@@ -64,10 +64,7 @@ def train_phase1(payload: Phase1Request) -> dict[str, Any]:
 def train_phase2(payload: Phase2Request) -> dict[str, Any]:
     trainer = _state.get("phase1_trainer")
     if trainer is None:
-        trainer = BidirectionalTrainer()
-        trainer.train_phase1(episodes=3)
-        _state["phase1_trainer"] = trainer
-        _state["phase1_summary"] = trainer.metrics_history[-1] if trainer.metrics_history else {}
+        raise HTTPException(status_code=400, detail="Phase 1 must be run before Phase 2. POST /train/phase1 first.")
     phase2_trainer = AdversarialTrainer(trainer, llm_interval=payload.llm_interval)
     summary = phase2_trainer.train_phase2(episodes=payload.episodes)
     _state["phase2_trainer"] = phase2_trainer

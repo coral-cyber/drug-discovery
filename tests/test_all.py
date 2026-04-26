@@ -354,6 +354,13 @@ def test_api_flow_endpoint(client, phase):
     assert "events" in response.json()
 
 
+def test_api_phase2_requires_phase1(client):
+    from api.main import _state
+    _state["phase1_trainer"] = None
+    response = client.post("/train/phase2", json={"episodes": 1})
+    assert response.status_code == 400
+
+
 @pytest.mark.parametrize("args", [["--phase1", "--episodes", "2", "--dimension", "6", "--max-steps", "3"], ["--phase2", "--episodes", "2", "--dimension", "6", "--max-steps", "3"], ["--phase1", "--phase2", "--episodes", "2", "--dimension", "6", "--max-steps", "3"], ["--episodes", "2", "--dimension", "6", "--max-steps", "3"]])
 def test_cli_runs(args):
     result = subprocess.run([sys.executable, "run_training.py", *args], capture_output=True, text=True, cwd="/workspace")

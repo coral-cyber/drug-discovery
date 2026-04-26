@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,8 @@ from core.utils import RewardNormalizer, safe_ratio
 from envs.ligand_env import LigandEnv
 from envs.receptor_env import ReceptorEnv
 from llm.llm_bridge import ClaudeLLMBridge
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,7 +50,7 @@ class BidirectionalTrainer:
         self.receptor_env.set_probe_hook(self._ligand_probe_hook)
 
     def preview_receptor_transition(self, context: dict[str, Any]) -> dict[str, Any]:
-        probe_readings = self.receptor_env._probe_readings()
+        probe_readings = self.receptor_env.probe_readings()
         obs = np.concatenate([self.receptor.clone_vector(), np.asarray(probe_readings, dtype=np.float64)])
         preview = self.receptor_agent.policy_mean(obs)
         return {"proposed_mutation": self.receptor_env.action_space.clip(preview).round(6).tolist(), "source": "ReceptorMutator preview"}
@@ -63,13 +66,17 @@ class BidirectionalTrainer:
         receptor_norm = self.receptor_rewards.update(receptor_reward)
         ratio = safe_ratio(ligand_norm + 1e-6, receptor_norm + 1e-6)
         if ratio > 3.0:
-            self.alerts.append(f"reward dominance alert ratio={ratio:.2f}")
+            msg = f"reward dominance alert ratio={ratio:.2f}"
+            self.alerts.append(msg)
+            logger.warning(msg)
 
     def _entropy_guards(self) -> None:
         if self.ligand_agent.ensure_entropy_floor(self.min_entropy):
             self.alerts.append("ligand entropy floor activated")
+            logger.info("ligand entropy floor activated")
         if self.receptor_agent.ensure_entropy_floor(self.min_entropy):
             self.alerts.append("receptor entropy floor activated")
+            logger.info("receptor entropy floor activated")
 
     def _record_flow(self, env_name: str, agent_name: str, llm_result: dict[str, Any], raw_action: np.ndarray, biased_action: np.ndarray, reward: float, info: dict[str, Any]) -> None:
         self.flow_history.append(
@@ -100,8 +107,7 @@ class BidirectionalTrainer:
                     llm_call = self.llm_bridge.generate_bias("LigandDesigner", self.ligand_env.get_state(), "maximize stable selective binding", self.dimension, episode, step)
                     ligand_decision = self.ligand_agent.select_action(observation, llm_bias=llm_call.bias_vector)
                 else:
-                    query = self.llm_bridge.build_query("LigandDesigner", self.ligand_env.get_state(), "maximize stable selective binding", self.dimension, episode, step)
-                    llm_call = type("Call", (), {"query": query, "response_text": "{}", "bias_vector": np.zeros(self.dimension), "used_remote_api": False})
+                    llm_call = self.llm_bridge.noop_result("LigandDesigner", self.ligand_env.get_state(), "maximize stable selective binding", self.dimension, episode, step)
                     ligand_decision = self.ligand_agent.select_action(observation)
                 next_obs, reward, done, info = self.ligand_env.step(ligand_decision["action"])
                 self.ligand_agent.store_transition(observation, ligand_decision["action"], reward, next_obs, ligand_decision["mean"], ligand_decision["entropy"], info)
@@ -125,8 +131,7 @@ class BidirectionalTrainer:
                 receptor_llm = self.llm_bridge.generate_bias("ReceptorMutator", receptor_reset_info["full_state"], "disrupt ligand binding while preserving receptor functionality", self.dimension, episode)
                 receptor_decision = self.receptor_agent.select_action(receptor_obs, llm_bias=receptor_llm.bias_vector)
             else:
-                query = self.llm_bridge.build_query("ReceptorMutator", receptor_reset_info["full_state"], "disrupt ligand binding while preserving receptor functionality", self.dimension, episode)
-                receptor_llm = type("Call", (), {"query": query, "response_text": "{}", "bias_vector": np.zeros(self.dimension), "used_remote_api": False})
+                receptor_llm = self.llm_bridge.noop_result("ReceptorMutator", receptor_reset_info["full_state"], "disrupt ligand binding while preserving receptor functionality", self.dimension, episode)
                 receptor_decision = self.receptor_agent.select_action(receptor_obs)
             _, receptor_reward, _, receptor_info = self.receptor_env.step(receptor_decision["action"])
             self.receptor_agent.store_episode(receptor_obs, receptor_decision["action"], receptor_reward, receptor_info)
@@ -187,8 +192,7 @@ class AdversarialTrainer:
                 llm_call = self.llm_bridge.generate_bias("EscapeAgent", reset_info["full_state"], "maximize binding disruption against the frozen best ligand", self.base_trainer.dimension, episode)
                 decision = self.escape_agent.select_action(receptor_obs, llm_bias=llm_call.bias_vector)
             else:
-                query = self.llm_bridge.build_query("EscapeAgent", reset_info["full_state"], "maximize binding disruption against the frozen best ligand", self.base_trainer.dimension, episode)
-                llm_call = type("Call", (), {"query": query, "response_text": "{}", "bias_vector": np.zeros(self.base_trainer.dimension), "used_remote_api": False})
+                llm_call = self.llm_bridge.noop_result("EscapeAgent", reset_info["full_state"], "maximize binding disruption against the frozen best ligand", self.base_trainer.dimension, episode)
                 decision = self.escape_agent.select_action(receptor_obs)
             _, reward, _, info = self.receptor_env.step(decision["action"])
             fixed_binding = self.receptor.binding_oracle(self.best_ligand).binding_score
