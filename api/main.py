@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
+import numpy as np
 
 from core.trainer import AdversarialTrainer, BidirectionalTrainer
 
@@ -11,6 +12,20 @@ from core.trainer import AdversarialTrainer, BidirectionalTrainer
 app = FastAPI(title="Bidirectional Adversarial RL API", version="1.0.0")
 
 _state: dict[str, Any] = {"phase1_trainer": None, "phase1_summary": None, "phase2_trainer": None, "phase2_summary": None}
+
+
+def _sanitize(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: _sanitize(inner) for key, inner in value.items()}
+    if isinstance(value, list):
+        return [_sanitize(inner) for inner in value]
+    if isinstance(value, tuple):
+        return [_sanitize(inner) for inner in value]
+    return value
 
 
 class Phase1Request(BaseModel):
@@ -41,8 +56,8 @@ def train_phase1(payload: Phase1Request) -> dict[str, Any]:
     trainer = BidirectionalTrainer(dimension=payload.dimension, max_steps=payload.max_steps, llm_interval=payload.llm_interval, seed=payload.seed)
     summary = trainer.train_phase1(episodes=payload.episodes)
     _state["phase1_trainer"] = trainer
-    _state["phase1_summary"] = summary.metrics
-    return {"phase": summary.phase, "episodes": summary.episodes, "metrics": summary.metrics}
+    _state["phase1_summary"] = _sanitize(summary.metrics)
+    return {"phase": summary.phase, "episodes": summary.episodes, "metrics": _sanitize(summary.metrics)}
 
 
 @app.post("/train/phase2")
@@ -56,23 +71,23 @@ def train_phase2(payload: Phase2Request) -> dict[str, Any]:
     phase2_trainer = AdversarialTrainer(trainer, llm_interval=payload.llm_interval)
     summary = phase2_trainer.train_phase2(episodes=payload.episodes)
     _state["phase2_trainer"] = phase2_trainer
-    _state["phase2_summary"] = summary.metrics
-    return {"phase": summary.phase, "episodes": summary.episodes, "metrics": summary.metrics}
+    _state["phase2_summary"] = _sanitize(summary.metrics)
+    return {"phase": summary.phase, "episodes": summary.episodes, "metrics": _sanitize(summary.metrics)}
 
 
 @app.get("/state")
 def state() -> dict[str, Any]:
     trainer = _state.get("phase1_trainer")
     receptor = trainer.receptor.as_dict() if trainer is not None else None
-    return {"phase1": _state.get("phase1_summary"), "phase2": _state.get("phase2_summary"), "receptor": receptor}
+    return {"phase1": _state.get("phase1_summary"), "phase2": _state.get("phase2_summary"), "receptor": _sanitize(receptor)}
 
 
 @app.get("/flow/{phase}")
 def flow(phase: str) -> dict[str, Any]:
     if phase == "phase1" and _state.get("phase1_trainer") is not None:
         trainer = _state["phase1_trainer"]
-        return {"phase": phase, "events": trainer.flow_history}
+        return {"phase": phase, "events": _sanitize(trainer.flow_history)}
     if phase == "phase2" and _state.get("phase2_trainer") is not None:
         trainer = _state["phase2_trainer"]
-        return {"phase": phase, "events": trainer.flow_history}
+        return {"phase": phase, "events": _sanitize(trainer.flow_history)}
     return {"phase": phase, "events": []}
